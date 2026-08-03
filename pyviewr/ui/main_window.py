@@ -5,8 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QObject, Qt, Signal, Slot
+from PySide6.QtCore import QObject, Qt, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
+    QComboBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -21,6 +22,8 @@ from PySide6.QtWidgets import (
 from pyviewr import config as app_config
 from pyviewr.camera.manager import CameraManager
 from pyviewr.ui.preview_widget import PreviewWidget
+
+TIMER_SECONDS = 10
 
 
 class _Bridge(QObject):
@@ -57,6 +60,17 @@ class MainWindow(QMainWindow):
         self._btn_still = QPushButton("Still")
         self._btn_record = QPushButton("Record")
         self._btn_save_dir = QPushButton("Save folder…")
+        self._btn_cancel_timer = QPushButton("Cancel timer")
+        self._btn_cancel_timer.setVisible(False)
+
+        self._timer_combo = QComboBox()
+        self._timer_combo.addItem("Timer: Off", 0)
+        self._timer_combo.addItem(f"Timer: {TIMER_SECONDS}s", TIMER_SECONDS)
+
+        self._lbl_countdown = QLabel("")
+        self._lbl_countdown.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._lbl_countdown.setStyleSheet("font-size: 28px; font-weight: bold;")
+        self._lbl_countdown.setVisible(False)
 
         self._lbl_devices = QLabel("Devices: —")
         self._lbl_save = QLabel(f"Save: {self._save_dir}")
@@ -64,20 +78,29 @@ class MainWindow(QMainWindow):
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
 
+        self._pending_action: str | None = None  # "still" | "record"
+        self._seconds_left = 0
+        self._countdown = QTimer(self)
+        self._countdown.setInterval(1000)
+        self._countdown.timeout.connect(self._on_countdown_tick)
+
         self._btn_refresh.clicked.connect(self.refresh_devices)
         self._btn_connect.clicked.connect(self.connect_cameras)
         self._btn_disconnect.clicked.connect(self.disconnect_cameras)
         self._btn_still.clicked.connect(self.capture_still)
         self._btn_record.clicked.connect(self.toggle_record)
         self._btn_save_dir.clicked.connect(self.choose_save_dir)
+        self._btn_cancel_timer.clicked.connect(self.cancel_timer)
 
         controls = QHBoxLayout()
         for w in (
             self._btn_refresh,
             self._btn_connect,
             self._btn_disconnect,
+            self._timer_combo,
             self._btn_still,
             self._btn_record,
+            self._btn_cancel_timer,
             self._btn_save_dir,
         ):
             controls.addWidget(w)
@@ -91,6 +114,7 @@ class MainWindow(QMainWindow):
         root.addLayout(controls)
         root.addWidget(self._lbl_devices)
         root.addWidget(self._lbl_save)
+        root.addWidget(self._lbl_countdown)
         root.addLayout(previews, stretch=1)
 
         central = QWidget()
@@ -100,6 +124,9 @@ class MainWindow(QMainWindow):
 
         self._set_connected_ui(False)
         self.refresh_devices()
+
+    def _timer_delay_seconds(self) -> int:
+        return int(self._timer_combo.currentData() or 0)
 
     def _emit_frame(self, index: int, frame: np.ndarray) -> None:
         self._bridge.frame.emit(index, frame)
@@ -124,12 +151,74 @@ class MainWindow(QMainWindow):
     def _set_connected_ui(self, connected: bool) -> None:
         self._btn_connect.setEnabled(not connected)
         self._btn_disconnect.setEnabled(connected)
-        self._btn_still.setEnabled(connected)
-        self._btn_record.setEnabled(connected)
+        counting = self._countdown.isActive()
+        self._btn_still.setEnabled(connected and not counting)
+        self._btn_record.setEnabled(connected and not counting)
+        self._timer_combo.setEnabled(connected and not counting)
         if not connected:
+            self.cancel_timer()
             self._btn_record.setText("Record")
             self._preview0.clear_frame()
             self._preview1.clear_frame()
+
+    def _set_countdown_ui(self, active: bool) -> None:
+        self._btn_cancel_timer.setVisible(active)
+        self._lbl_countdown.setVisible(active)
+        connected = self._manager.is_open
+        self._btn_still.setEnabled(connected and not active)
+        # Stop must stay available while recording; start waits for timer.
+        if self._manager.is_recording:
+            self._btn_record.setEnabled(True)
+        else:
+            self._btn_record.setEnabled(connected and not active)
+        self._timer_combo.setEnabled(connected and not active)
+        self._btn_disconnect.setEnabled(connected and not active)
+
+    def _start_countdown(self, action: str) -> None:
+        delay = self._timer_delay_seconds()
+        if delay <= 0:
+            self._run_action(action)
+            return
+        self._pending_action = action
+        self._seconds_left = delay
+        self._lbl_countdown.setText(str(self._seconds_left))
+        self._set_countdown_ui(True)
+        self.statusBar().showMessage(f"Timer: {self._seconds_left}s → {action}", 0)
+        self._countdown.start()
+
+    @Slot()
+    def _on_countdown_tick(self) -> None:
+        self._seconds_left -= 1
+        if self._seconds_left > 0:
+            self._lbl_countdown.setText(str(self._seconds_left))
+            action = self._pending_action or ""
+            self.statusBar().showMessage(f"Timer: {self._seconds_left}s → {action}", 0)
+            return
+        action = self._pending_action
+        self._finish_countdown_ui()
+        if action:
+            self._run_action(action)
+
+    def _finish_countdown_ui(self) -> None:
+        self._countdown.stop()
+        self._pending_action = None
+        self._seconds_left = 0
+        self._lbl_countdown.setText("")
+        self._set_countdown_ui(False)
+
+    @Slot()
+    def cancel_timer(self) -> None:
+        if not self._countdown.isActive() and self._pending_action is None:
+            self._finish_countdown_ui()
+            return
+        self._finish_countdown_ui()
+        self.statusBar().showMessage("Timer cancelled", 3000)
+
+    def _run_action(self, action: str) -> None:
+        if action == "still":
+            self._do_capture_still()
+        elif action == "record":
+            self._do_start_recording()
 
     @Slot()
     def refresh_devices(self) -> None:
@@ -174,6 +263,7 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def disconnect_cameras(self) -> None:
+        self.cancel_timer()
         try:
             self._manager.close()
         except Exception as exc:
@@ -185,6 +275,11 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def capture_still(self) -> None:
+        if self._countdown.isActive():
+            return
+        self._start_countdown("still")
+
+    def _do_capture_still(self) -> None:
         try:
             paths = self._manager.capture_still(self._save_dir)
         except Exception as exc:
@@ -195,16 +290,9 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def toggle_record(self) -> None:
-        if not self._manager.is_recording:
-            try:
-                paths = self._manager.start_recording(self._save_dir)
-            except Exception as exc:
-                QMessageBox.critical(self, "Pyviewr", str(exc))
-                return
-            self._btn_record.setText("Stop")
-            names = ", ".join(p.name for p in paths)
-            self.statusBar().showMessage(f"Recording: {names}", 0)
-        else:
+        if self._manager.is_recording:
+            # Stop is always immediate (no timer).
+            self.cancel_timer()
             try:
                 self._manager.stop_recording()
             except Exception as exc:
@@ -212,6 +300,21 @@ class MainWindow(QMainWindow):
                 return
             self._btn_record.setText("Record")
             self.statusBar().showMessage("Recording stopped", 3000)
+            return
+
+        if self._countdown.isActive():
+            return
+        self._start_countdown("record")
+
+    def _do_start_recording(self) -> None:
+        try:
+            paths = self._manager.start_recording(self._save_dir)
+        except Exception as exc:
+            QMessageBox.critical(self, "Pyviewr", str(exc))
+            return
+        self._btn_record.setText("Stop")
+        names = ", ".join(p.name for p in paths)
+        self.statusBar().showMessage(f"Recording: {names}", 0)
 
     @Slot()
     def choose_save_dir(self) -> None:
@@ -226,6 +329,7 @@ class MainWindow(QMainWindow):
         self._lbl_save.setText(f"Save: {self._save_dir}")
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        self.cancel_timer()
         try:
             self._manager.close()
         except Exception:

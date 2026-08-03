@@ -13,6 +13,7 @@ Inspired by [pylon Viewer](https://www.baslerweb.com/en/software/pylon/pylon-vie
 - Video recording (AVI / MJPG)
 - Easy save-folder selection (persisted in `config.json`)
 - Dual-camera synchronized still (and aligned video start) via GigE [Action Commands](https://docs.baslerweb.com/action-commands)
+- Optional 10-second timer for still and record start (Off by default; Stop is always immediate)
 
 Not included: feature tree, color calibration, sharpness tools, bandwidth manager, vTools / image processing.
 
@@ -48,10 +49,11 @@ python -m pyviewr
 
 1. Click **Refresh** to list cameras.
 2. Click **Connect** — opens the first one or two cameras and starts preview.
-3. **Still** — saves `camN_YYYYMMDD_HHMMSS_mmm.png` into the save folder.  
+3. **Timer** — choose `Timer: Off` (immediate) or `Timer: 10s`. Applies to Still and Record start. Use **Cancel timer** to abort. Stop is always immediate.
+4. **Still** — saves `camN_YYYYMMDD_HHMMSS_mmm.png` into the save folder.  
    With two cameras, exposure is triggered by a single GigE Action Command.
-4. **Record** / **Stop** — writes `camN_....avi` (MJPG). With two cameras, the start is aligned with an Action Command, then free-run continues.
-5. **Save folder…** — choose where files are written (stored in `config.json`).
+5. **Record** / **Stop** — writes `camN_....avi` (MJPG). With two cameras, the start is aligned with an Action Command, then free-run continues.
+6. **Save folder…** — choose where files are written (stored in `config.json`).
 
 Default save directory: `~/Pictures/Pyviewr/`
 
