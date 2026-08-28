@@ -14,6 +14,7 @@ import numpy as np
 from pyviewr.camera import sync as sync_mod
 from pyviewr.io.still import save_still
 from pyviewr.io.video import VideoRecorder
+from pyviewr.processing.enhance import EnhanceParams, apply as apply_enhance
 
 try:
     from pypylon import genicam, pylon
@@ -24,6 +25,10 @@ except ImportError:  # pragma: no cover - runtime dependency
 
 FrameCallback = Callable[[int, np.ndarray], None]
 ErrorCallback = Callable[[str], None]
+DeviceRemovedCallback = Callable[[int], None]
+
+# GenICam auto-function node that must be "Off" before manual writes.
+_AUTO_NODE = {"ExposureTime": "ExposureAuto", "Gain": "GainAuto"}
 
 
 @dataclass(frozen=True)
@@ -34,12 +39,24 @@ class DeviceInfo:
     display_name: str
 
 
+@dataclass(frozen=True)
+class FeatureInfo:
+    name: str
+    value: float
+    minimum: float
+    maximum: float
+
+
 def _require_pylon() -> None:
     if pylon is None:
         raise RuntimeError(
             "pypylon is not installed, or Basler pylon Software Suite is missing. "
             "Install pylon 7.1+ then: pip install pypylon"
         )
+
+
+def _is_physically_removed_message(message: str) -> bool:
+    return "physically removed" in message.lower()
 
 
 def array_from_grab(result) -> np.ndarray:
@@ -65,18 +82,33 @@ class CameraManager:
         self,
         on_frame: FrameCallback | None = None,
         on_error: ErrorCallback | None = None,
+        on_device_removed: DeviceRemovedCallback | None = None,
     ) -> None:
         _require_pylon()
         self._on_frame = on_frame
         self._on_error = on_error
+        self._on_device_removed = on_device_removed
         self._tl_factory = pylon.TlFactory.GetInstance()
         self._cameras: list[pylon.InstantCamera] = []
         self._threads: list[threading.Thread] = []
         self._stop = threading.Event()
+        self._device_removed = threading.Event()
         self._grabbing = False
         self._recording = False
         self._recorders: dict[int, VideoRecorder] = {}
         self._lock = threading.Lock()
+        self._enhance_params = EnhanceParams()
+
+    def set_enhance_params(self, params: EnhanceParams) -> None:
+        """Use the same software enhance for Still / Record as the preview."""
+        self._enhance_params = params
+
+    def _frame_for_save(self, frame: np.ndarray) -> np.ndarray:
+        """Apply enhance for disk output; leave preview path on raw frames."""
+        try:
+            return apply_enhance(frame, self._enhance_params)
+        except Exception:
+            return frame
 
     # ----- discovery / lifecycle -------------------------------------------------
 
@@ -152,12 +184,77 @@ class CameraManager:
         self.stop_recording()
         self.stop_grabbing()
         for cam in self._cameras:
-            try:
-                if cam.IsOpen():
-                    cam.Close()
-            except Exception:
-                pass
+            self._dispose_camera(cam)
         self._cameras.clear()
+        self._device_removed.clear()
+
+    @staticmethod
+    def _dispose_camera(cam: "pylon.InstantCamera") -> None:
+        """Stop / close / destroy a camera, including after physical removal."""
+        try:
+            if cam.IsGrabbing():
+                cam.StopGrabbing()
+        except Exception:
+            pass
+        try:
+            if cam.IsOpen():
+                cam.Close()
+        except Exception:
+            pass
+        try:
+            # Required after physical removal so the TL can rediscover the device.
+            cam.DestroyDevice()
+        except Exception:
+            pass
+
+    # ----- camera features (exposure / gain / gamma) ------------------------------
+
+    def get_feature_info(self, name: str) -> FeatureInfo | None:
+        """Read value + range of a float feature from the first camera."""
+        if not self._cameras:
+            return None
+        node = getattr(self._cameras[0], name, None)
+        if node is None:
+            return None
+        try:
+            return FeatureInfo(
+                name=name,
+                value=float(node.GetValue()),
+                minimum=float(node.GetMin()),
+                maximum=float(node.GetMax()),
+            )
+        except Exception:
+            return None
+
+    def set_feature(self, name: str, value: float) -> None:
+        """Set a float feature on all open cameras (clamped to valid range).
+
+        Disables the matching auto function (ExposureAuto/GainAuto) first so
+        the manual value sticks. Safe to call while grabbing.
+        """
+        if not self._cameras:
+            raise RuntimeError("No cameras open.")
+        errors: list[str] = []
+        for i, cam in enumerate(self._cameras):
+            try:
+                auto_name = _AUTO_NODE.get(name)
+                if auto_name is not None:
+                    auto_node = getattr(cam, auto_name, None)
+                    if auto_node is not None:
+                        try:
+                            if auto_node.GetValue() != "Off":
+                                auto_node.SetValue("Off")
+                        except Exception:
+                            pass
+                node = getattr(cam, name, None)
+                if node is None:
+                    raise RuntimeError(f"feature not available: {name}")
+                clamped = min(max(value, float(node.GetMin())), float(node.GetMax()))
+                node.SetValue(clamped)
+            except Exception as exc:
+                errors.append(f"cam{i}: {exc}")
+        if errors:
+            raise RuntimeError(f"Set {name} failed — " + "; ".join(errors))
 
     # ----- grabbing --------------------------------------------------------------
 
@@ -166,6 +263,7 @@ class CameraManager:
             raise RuntimeError("No cameras open.")
         if self._grabbing:
             return
+        self._device_removed.clear()
         for cam in self._cameras:
             sync_mod.configure_free_run(cam)
             if not cam.IsGrabbing():
@@ -196,9 +294,31 @@ class CameraManager:
                 pass
         self._grabbing = False
 
+    def _camera_device_removed(self, cam: "pylon.InstantCamera") -> bool:
+        try:
+            return bool(cam.IsCameraDeviceRemoved())
+        except Exception:
+            return False
+
+    def _notify_device_removed(self, index: int) -> None:
+        """Stop all grab loops and notify once that a camera vanished."""
+        if self._device_removed.is_set():
+            return
+        self._device_removed.set()
+        self._stop.set()
+        if self._on_device_removed is not None:
+            self._on_device_removed(index)
+        elif self._on_error is not None:
+            self._on_error(
+                f"Camera {index}: device physically removed — disconnecting"
+            )
+
     def _grab_loop(self, index: int, cam: "pylon.InstantCamera") -> None:
         while not self._stop.is_set():
             try:
+                if self._camera_device_removed(cam):
+                    self._notify_device_removed(index)
+                    return
                 if not cam.IsGrabbing():
                     time.sleep(0.01)
                     continue
@@ -210,10 +330,16 @@ class CameraManager:
                 with self._lock:
                     rec = self._recorders.get(index)
                     if rec is not None:
-                        rec.write(frame)
+                        rec.write(self._frame_for_save(frame))
                 if self._on_frame is not None:
                     self._on_frame(index, frame)
-            except Exception as exc:  # keep loop alive
+            except Exception as exc:
+                # Physical unplug / link loss: InstantCamera stays open but is dead.
+                if self._camera_device_removed(cam) or _is_physically_removed_message(
+                    str(exc)
+                ):
+                    self._notify_device_removed(index)
+                    return
                 if self._on_error is not None:
                     self._on_error(f"Camera {index}: {exc}")
                 time.sleep(0.05)
@@ -256,7 +382,7 @@ class CameraManager:
                     raise RuntimeError("Still grab failed.")
                 frame = array_from_grab(grab)
             path = save_dir / f"cam0_{stamp}.png"
-            save_still(path, frame)
+            save_still(path, self._frame_for_save(frame))
             paths.append(path)
         finally:
             if cam.IsGrabbing():
@@ -284,7 +410,7 @@ class CameraManager:
 
             for i, frame in enumerate(frames):
                 path = save_dir / f"cam{i}_{stamp}.png"
-                save_still(path, frame)
+                save_still(path, self._frame_for_save(frame))
                 paths.append(path)
         finally:
             for cam in self._cameras:
@@ -355,7 +481,7 @@ class CameraManager:
                         with self._lock:
                             rec = self._recorders.get(idx)
                             if rec is not None:
-                                rec.write(frame)
+                                rec.write(self._frame_for_save(frame))
         finally:
             for cam in self._cameras:
                 try:

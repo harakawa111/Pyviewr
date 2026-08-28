@@ -53,15 +53,20 @@ class PreviewWidget(QWidget):
         if frame is None:
             return
         h, w = frame.shape[:2]
-        if frame.ndim != 2:
+        if frame.ndim == 2:
+            fmt = QImage.Format.Format_Grayscale8
+            bytes_per_line = w
+        elif frame.ndim == 3 and frame.shape[2] == 3:
+            fmt = QImage.Format.Format_RGB888
+            bytes_per_line = w * 3
+        else:
             return
-        bytes_per_line = w
         qimg = QImage(
             frame.data,
             w,
             h,
             bytes_per_line,
-            QImage.Format.Format_Grayscale8,
+            fmt,
         ).copy()
         pix = QPixmap.fromImage(qimg)
         scaled = pix.scaled(

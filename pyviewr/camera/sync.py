@@ -49,11 +49,26 @@ def issue_action_command(tl_factory: Any, address: str = "255.255.255.255") -> N
     tl_type = getattr(pylon, "BaslerGigEDeviceClass", "BaslerGigE")
     gige_tl = tl_factory.CreateTl(tl_type)
     try:
-        gige_tl.IssueActionCommand(
-            ACTION_DEVICE_KEY,
-            ACTION_GROUP_KEY,
-            ACTION_GROUP_MASK,
-            address,
-        )
+        # pypylon 26.x+: IssueActionCommand was split into NoWait / Wait.
+        # Older builds still expose IssueActionCommand.
+        if hasattr(gige_tl, "IssueActionCommandNoWait"):
+            gige_tl.IssueActionCommandNoWait(
+                ACTION_DEVICE_KEY,
+                ACTION_GROUP_KEY,
+                ACTION_GROUP_MASK,
+                address,
+            )
+        elif hasattr(gige_tl, "IssueActionCommand"):
+            gige_tl.IssueActionCommand(
+                ACTION_DEVICE_KEY,
+                ACTION_GROUP_KEY,
+                ACTION_GROUP_MASK,
+                address,
+            )
+        else:
+            raise RuntimeError(
+                "GigE TL has no Action Command API "
+                "(need IssueActionCommandNoWait or IssueActionCommand)"
+            )
     finally:
         tl_factory.ReleaseTl(gige_tl)
