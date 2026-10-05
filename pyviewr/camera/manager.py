@@ -11,9 +11,10 @@ from typing import Callable
 
 import numpy as np
 
+from pyviewr import config as app_config
 from pyviewr.camera import sync as sync_mod
 from pyviewr.io.still import save_still
-from pyviewr.io.video import VideoRecorder
+from pyviewr.io.video import DEFAULT_VIDEO_FPS, VideoRecorder
 from pyviewr.processing.enhance import EnhanceParams, apply as apply_enhance
 
 try:
@@ -29,6 +30,7 @@ DeviceRemovedCallback = Callable[[int], None]
 
 # GenICam auto-function node that must be "Off" before manual writes.
 _AUTO_NODE = {"ExposureTime": "ExposureAuto", "Gain": "GainAuto"}
+_PREVIEW_FPS = 10.0
 
 
 @dataclass(frozen=True)
@@ -90,6 +92,7 @@ class CameraManager:
         self._on_device_removed = on_device_removed
         self._tl_factory = pylon.TlFactory.GetInstance()
         self._cameras: list[pylon.InstantCamera] = []
+        self._slots: list[int] = []
         self._threads: list[threading.Thread] = []
         self._stop = threading.Event()
         self._device_removed = threading.Event()
@@ -97,6 +100,7 @@ class CameraManager:
         self._recording = False
         self._recorders: dict[int, VideoRecorder] = {}
         self._lock = threading.Lock()
+        self._last_preview_at: dict[int, float] = {}
         self._enhance_params = EnhanceParams()
 
     def set_enhance_params(self, params: EnhanceParams) -> None:
@@ -104,7 +108,7 @@ class CameraManager:
         self._enhance_params = params
 
     def _frame_for_save(self, frame: np.ndarray) -> np.ndarray:
-        """Apply enhance for disk output; leave preview path on raw frames."""
+        """Apply enhance for still images and post-processed video output."""
         try:
             return apply_enhance(frame, self._enhance_params)
         except Exception:
@@ -180,12 +184,81 @@ class CameraManager:
             raise
         return opened
 
+    def _resolve_slot_order(
+        self, devices: list[DeviceInfo]
+    ) -> tuple[list[tuple[int, int]], dict[str, str]]:
+        """Pair each device with its UVL(0) / UVR(1) slot.
+
+        Matches devices to their persisted serial -> label identity first.
+        Any device with an unrecognized serial fills the next open slot (UVL
+        before UVR), so the *first* camera ever seen becomes UVL and the
+        second becomes UVR — after that, identity sticks regardless of USB
+        enumeration order or whether the other camera is connected at all.
+        A slot with no matching or fallback device is simply absent, so a
+        lone UVR camera keeps slot 1 rather than sliding into slot 0.
+        Devices beyond the two known slots get their own trailing slots.
+
+        Returns a list of (device_index, slot_index) pairs, ordered by slot,
+        plus any newly-learned serial -> label identity to persist.
+        """
+        identity = app_config.load_camera_identity()
+        by_label: dict[str, int] = {}
+        unknown: list[int] = []
+        for i, d in enumerate(devices):
+            label = identity.get(d.serial)
+            if label in app_config.SLOT_LABELS and label not in by_label:
+                by_label[label] = i
+            else:
+                unknown.append(i)
+
+        updates: dict[str, str] = {}
+        ordered: list[tuple[int, int]] = []
+        for slot, label in enumerate(app_config.SLOT_LABELS):
+            if label in by_label:
+                ordered.append((by_label[label], slot))
+            elif unknown:
+                idx = unknown.pop(0)
+                ordered.append((idx, slot))
+                if devices[idx].serial:
+                    updates[devices[idx].serial] = label
+        extra_slot = len(app_config.SLOT_LABELS)
+        for idx in unknown:
+            ordered.append((idx, extra_slot))
+            extra_slot += 1
+        return ordered, updates
+
+    def open_identified(self, max_devices: int = 2) -> list[DeviceInfo]:
+        """Open up to max_devices cameras in a stable UVL / UVR slot order.
+
+        Slot 0 is always the camera identified as UVL, slot 1 always UVR,
+        keyed by serial number rather than USB enumeration order — so a lone
+        UVR camera shows up as "Camera 1", not "Camera 0", and which physical
+        camera lands where no longer depends on connection order.
+        """
+        devices = self.enumerate_devices()
+        if not devices:
+            raise RuntimeError("No cameras found.")
+        pairs, updates = self._resolve_slot_order(devices)
+        for serial, label in updates.items():
+            app_config.save_camera_identity(serial, label)
+        pairs = pairs[:max_devices]
+        opened = self.open([device_index for device_index, _ in pairs])
+        self._slots = [slot for _, slot in pairs]
+        return opened
+
+    def _slot(self, index: int) -> int:
+        """Translate an internal (dense) camera index to its UVL/UVR slot."""
+        if 0 <= index < len(self._slots):
+            return self._slots[index]
+        return index
+
     def close(self) -> None:
-        self.stop_recording()
         self.stop_grabbing()
+        self.stop_recording()
         for cam in self._cameras:
             self._dispose_camera(cam)
         self._cameras.clear()
+        self._slots.clear()
         self._device_removed.clear()
 
     @staticmethod
@@ -226,6 +299,25 @@ class CameraManager:
         except Exception:
             return None
 
+    def get_resulting_fps(self) -> float | None:
+        """Read the camera's achievable frame rate under current settings.
+
+        Reflects ExposureTime / ROI / bandwidth right now (no AcquisitionFrameRate
+        limit is set anywhere in this app, so this is effectively the max fps).
+        """
+        if not self._cameras:
+            return None
+        cam = self._cameras[0]
+        for name in ("ResultingFrameRate", "ResultingFrameRateAbs"):
+            node = getattr(cam, name, None)
+            if node is None:
+                continue
+            try:
+                return float(node.GetValue())
+            except Exception:
+                continue
+        return None
+
     def set_feature(self, name: str, value: float) -> None:
         """Set a float feature on all open cameras (clamped to valid range).
 
@@ -264,10 +356,16 @@ class CameraManager:
         if self._grabbing:
             return
         self._device_removed.clear()
+        self._last_preview_at.clear()
         for cam in self._cameras:
             sync_mod.configure_free_run(cam)
             if not cam.IsGrabbing():
-                cam.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+                strategy = (
+                    pylon.GrabStrategy_OneByOne
+                    if self._recording
+                    else pylon.GrabStrategy_LatestImageOnly
+                )
+                cam.StartGrabbing(strategy)
         self._stop.clear()
         self._grabbing = True
         self._threads = []
@@ -286,6 +384,7 @@ class CameraManager:
         for t in self._threads:
             t.join(timeout=2.0)
         self._threads.clear()
+        self._last_preview_at.clear()
         for cam in self._cameras:
             try:
                 if cam.IsGrabbing():
@@ -317,7 +416,7 @@ class CameraManager:
         while not self._stop.is_set():
             try:
                 if self._camera_device_removed(cam):
-                    self._notify_device_removed(index)
+                    self._notify_device_removed(self._slot(index))
                     return
                 if not cam.IsGrabbing():
                     time.sleep(0.01)
@@ -329,19 +428,33 @@ class CameraManager:
                     frame = array_from_grab(grab)
                 with self._lock:
                     rec = self._recorders.get(index)
-                    if rec is not None:
-                        rec.write(self._frame_for_save(frame))
-                if self._on_frame is not None:
-                    self._on_frame(index, frame)
+                # Preview is intentionally throttled.  During recording the
+                # acquisition threads must not flood the Qt event queue with
+                # one signal per camera frame.  Emit it before the disk
+                # write, which can block for a while under backpressure —
+                # otherwise a slow disk would stall this camera's preview,
+                # and (since the write used to happen under the lock shared
+                # with the other camera's grab thread) the other camera's
+                # preview too.
+                now = time.monotonic()
+                last_preview = self._last_preview_at.get(index, 0.0)
+                if (
+                    self._on_frame is not None
+                    and now - last_preview >= 1.0 / _PREVIEW_FPS
+                ):
+                    self._last_preview_at[index] = now
+                    self._on_frame(self._slot(index), frame)
+                if rec is not None:
+                    rec.write(frame)
             except Exception as exc:
                 # Physical unplug / link loss: InstantCamera stays open but is dead.
                 if self._camera_device_removed(cam) or _is_physically_removed_message(
                     str(exc)
                 ):
-                    self._notify_device_removed(index)
+                    self._notify_device_removed(self._slot(index))
                     return
                 if self._on_error is not None:
-                    self._on_error(f"Camera {index}: {exc}")
+                    self._on_error(f"Camera {self._slot(index)}: {exc}")
                 time.sleep(0.05)
 
     # ----- still -----------------------------------------------------------------
@@ -381,7 +494,7 @@ class CameraManager:
                 if not grab.GrabSucceeded():
                     raise RuntimeError("Still grab failed.")
                 frame = array_from_grab(grab)
-            path = save_dir / f"cam0_{stamp}.png"
+            path = save_dir / f"cam{self._slot(0)}_{stamp}.png"
             save_still(path, self._frame_for_save(frame))
             paths.append(path)
         finally:
@@ -405,11 +518,13 @@ class CameraManager:
                 grab = cam.RetrieveResult(5000, pylon.TimeoutHandling_ThrowException)
                 with grab:
                     if not grab.GrabSucceeded():
-                        raise RuntimeError(f"Still grab failed on camera {i}.")
+                        raise RuntimeError(
+                            f"Still grab failed on camera {self._slot(i)}."
+                        )
                     frames.append(array_from_grab(grab))
 
             for i, frame in enumerate(frames):
-                path = save_dir / f"cam{i}_{stamp}.png"
+                path = save_dir / f"cam{self._slot(i)}_{stamp}.png"
                 save_still(path, self._frame_for_save(frame))
                 paths.append(path)
         finally:
@@ -427,7 +542,9 @@ class CameraManager:
 
     # ----- video -----------------------------------------------------------------
 
-    def start_recording(self, save_dir: Path, fps: float = 30.0) -> list[Path]:
+    def start_recording(
+        self, save_dir: Path, fps: float = DEFAULT_VIDEO_FPS
+    ) -> list[Path]:
         if not self._cameras:
             raise RuntimeError("No cameras open.")
         if self._recording:
@@ -452,14 +569,30 @@ class CameraManager:
         with self._lock:
             self._recorders.clear()
             for i, (w, h) in enumerate(sizes):
-                path = save_dir / f"cam{i}_{stamp}.avi"
-                self._recorders[i] = VideoRecorder(path, (w, h), fps=fps)
+                path = save_dir / f"cam{self._slot(i)}_{stamp}.mp4"
+                self._recorders[i] = VideoRecorder(
+                    path,
+                    (w, h),
+                    fps=fps,
+                    frame_processor=self._frame_for_save,
+                    on_complete=lambda path, index=i: self._video_postprocess_done(
+                        index, path
+                    ),
+                    on_error=lambda message, index=i: self._video_postprocess_error(
+                        index, message
+                    ),
+                )
                 paths.append(path)
             self._recording = True
 
         # Align start for multi-cam with a single action pulse then free-run.
         if len(self._cameras) >= 2:
             self._restart_free_run_aligned()
+        else:
+            # Re-open the single-camera grab stream with OneByOne.  The
+            # connected preview normally uses LatestImageOnly.
+            self.stop_grabbing()
+            self.start_grabbing()
         return paths
 
     def _restart_free_run_aligned(self) -> None:
@@ -480,8 +613,8 @@ class CameraManager:
                         frame = array_from_grab(grab)
                         with self._lock:
                             rec = self._recorders.get(idx)
-                            if rec is not None:
-                                rec.write(self._frame_for_save(frame))
+                        if rec is not None:
+                            rec.write(frame)
         finally:
             for cam in self._cameras:
                 try:
@@ -492,10 +625,49 @@ class CameraManager:
                 sync_mod.configure_free_run(cam)
             self.start_grabbing()
 
+    def _video_postprocess_done(self, index: int, path: Path) -> None:
+        if self._on_error is not None:
+            self._on_error(f"Camera {self._slot(index)}: video saved: {path.name}")
+
+    def _video_postprocess_error(self, index: int, message: str) -> None:
+        if self._on_error is not None:
+            self._on_error(
+                f"Camera {self._slot(index)}: video post-processing failed: {message}"
+            )
+
     def stop_recording(self) -> None:
         with self._lock:
-            recorders = list(self._recorders.values())
+            recording = self._recording or bool(self._recorders)
+        if not recording:
+            return
+
+        was_grabbing = self._grabbing
+        if was_grabbing:
+            # Stop retrieval first so every frame already accepted by the
+            # recorder can drain to the raw spool before post-processing.
+            self.stop_grabbing()
+
+        with self._lock:
+            recorders = list(self._recorders.items())
+            ended_at = time.monotonic()
             self._recorders.clear()
             self._recording = False
-        for rec in recorders:
-            rec.close()
+
+        first_error: Exception | None = None
+        for index, rec in recorders:
+            try:
+                rec.close(ended_at)
+                if rec.backpressure_events and self._on_error is not None:
+                    self._on_error(
+                        f"Camera {self._slot(index)}: disk spool was busy "
+                        f"({rec.backpressure_events} waits); capture may be slower "
+                        "than the camera rate."
+                    )
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+
+        if was_grabbing and self._cameras:
+            self.start_grabbing()
+        if first_error is not None:
+            raise first_error

@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QObject, Qt, QTimer, Signal, Slot
+from PySide6.QtCore import QElapsedTimer, QObject, Qt, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -119,7 +119,22 @@ class MainWindow(QMainWindow):
         self._lbl_countdown.setStyleSheet("font-size: 28px; font-weight: bold;")
         self._lbl_countdown.setVisible(False)
 
+        self._lbl_recording_time = QLabel("")
+        self._lbl_recording_time.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._lbl_recording_time.setStyleSheet(
+            "color: #d32f2f; font-size: 20px; font-weight: bold;"
+        )
+        self._lbl_recording_time.setVisible(False)
+        self._recording_elapsed = QElapsedTimer()
+        self._recording_timer = QTimer(self)
+        self._recording_timer.setInterval(1000)
+        self._recording_timer.timeout.connect(self._update_recording_time)
+
         self._lbl_devices = QLabel("Devices: —")
+        self._lbl_fps = QLabel("FPS: —")
+        self._fps_timer = QTimer(self)
+        self._fps_timer.setInterval(500)
+        self._fps_timer.timeout.connect(self._update_fps_label)
         self._lbl_save = QLabel(f"Save: {self._save_dir}")
         self._lbl_save.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
@@ -179,8 +194,10 @@ class MainWindow(QMainWindow):
         root = QVBoxLayout()
         root.addLayout(controls)
         root.addWidget(self._lbl_devices)
+        root.addWidget(self._lbl_fps)
         root.addWidget(self._lbl_save)
         root.addWidget(self._lbl_countdown)
+        root.addWidget(self._lbl_recording_time)
         root.addLayout(previews, stretch=1)
 
         central = QWidget()
@@ -295,7 +312,13 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.statusBar().showMessage(str(exc), 5000)
             return
+        self._update_fps_label()
         self._schedule_save_settings()
+
+    @Slot()
+    def _update_fps_label(self) -> None:
+        fps = self._manager.get_resulting_fps()
+        self._lbl_fps.setText("FPS: —" if fps is None else f"FPS: {fps:.1f}")
 
     def _load_camera_panel(self) -> None:
         infos = {
@@ -362,8 +385,13 @@ class MainWindow(QMainWindow):
         self._btn_still.setEnabled(connected and not counting)
         self._btn_record.setEnabled(connected and not counting)
         self._timer_combo.setEnabled(connected and not counting)
-        if not connected:
+        if connected:
+            self._fps_timer.start()
+        else:
+            self._fps_timer.stop()
+            self._lbl_fps.setText("FPS: —")
             self.cancel_timer()
+            self._stop_recording_time()
             self._clear_pause()
             self._btn_record.setText("Record")
             self._preview0.clear_frame()
@@ -449,8 +477,9 @@ class MainWindow(QMainWindow):
             if not devices:
                 QMessageBox.warning(self, "Pyviewr", "No cameras found.")
                 return
-            # Open up to first two cameras.
-            opened = self._manager.open(list(range(min(2, len(devices)))))
+            # Open with a stable UVL -> Camera 0 / UVR -> Camera 1 identity,
+            # independent of which one happens to enumerate first over USB.
+            opened = self._manager.open_identified()
             self._manager.start_grabbing()
         except Exception as exc:
             QMessageBox.critical(self, "Pyviewr", str(exc))
@@ -458,17 +487,21 @@ class MainWindow(QMainWindow):
             self._set_connected_ui(False)
             return
 
+        identity = app_config.load_camera_identity()
         if len(opened) >= 1:
-            self._preview0.set_title(f"Camera 0 — {opened[0].display_name}")
+            label = identity.get(opened[0].serial, "?")
+            self._preview0.set_title(f"Camera 0 ({label}) — {opened[0].display_name}")
         if len(opened) >= 2:
-            self._preview1.set_title(f"Camera 1 — {opened[1].display_name}")
+            label = identity.get(opened[1].serial, "?")
+            self._preview1.set_title(f"Camera 1 ({label}) — {opened[1].display_name}")
         else:
-            self._preview1.set_title("Camera 1 — (not connected)")
+            self._preview1.set_title("Camera 1 (UVR) — (not connected)")
             self._preview1.clear_frame()
 
         self._set_connected_ui(True)
         self._apply_saved_camera_features()
         self._load_camera_panel()
+        self._update_fps_label()
         self.statusBar().showMessage(f"Connected: {len(opened)} camera(s)", 3000)
         self.refresh_devices()
 
@@ -509,6 +542,7 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 QMessageBox.critical(self, "Pyviewr", str(exc))
                 return
+            self._stop_recording_time()
             self._btn_record.setText("Record")
             self.statusBar().showMessage("Recording stopped", 3000)
             return
@@ -524,8 +558,28 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Pyviewr", str(exc))
             return
         self._btn_record.setText("Stop")
+        self._recording_elapsed.start()
+        self._update_recording_time()
+        self._recording_timer.start()
         names = ", ".join(p.name for p in paths)
         self.statusBar().showMessage(f"Recording: {names}", 0)
+
+    def _update_recording_time(self) -> None:
+        if not self._recording_elapsed.isValid():
+            return
+        elapsed = self._recording_elapsed.elapsed() // 1000
+        hours, remainder = divmod(elapsed, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        self._lbl_recording_time.setText(
+            f"Recording time: {hours:02d}:{minutes:02d}:{seconds:02d}"
+        )
+        self._lbl_recording_time.setVisible(True)
+
+    def _stop_recording_time(self) -> None:
+        self._recording_timer.stop()
+        self._recording_elapsed.invalidate()
+        self._lbl_recording_time.clear()
+        self._lbl_recording_time.setVisible(False)
 
     @Slot()
     def choose_save_dir(self) -> None:

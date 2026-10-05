@@ -23,6 +23,8 @@ Thumbs.db
 config.json
 *.png
 *.avi
+*.mp4
+*.raw
 *.tif
 *.tiff
 !docs/**

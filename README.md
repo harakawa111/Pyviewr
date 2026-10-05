@@ -10,7 +10,7 @@ Inspired by [pylon Viewer](https://www.baslerweb.com/en/software/pylon/pylon-vie
 
 - Live preview (full frame fitted to the window)
 - Still capture (PNG)
-- Video recording (AVI / MJPG)
+- Video recording (MP4 / MPEG-4)
 - Easy save-folder selection (persisted in `config.json`)
 - Dual-camera synchronized still (and aligned video start) via GigE [Action Commands](https://docs.baslerweb.com/action-commands)
 - Optional 10-second timer for still and record start (Off by default; Stop is always immediate)
@@ -23,6 +23,25 @@ Not included: feature tree, color calibration, sharpness tools, bandwidth manage
    Download: https://www.baslerweb.com/en/software/pylon/
 2. **Python 3.11+**
 3. For 5GigE cameras: a suitable NIC and network setup (Jumbo frames recommended)
+
+### Recording PC requirements
+
+For the target 2840×2840 Mono8 camera at 67 fps, the raw input is about
+540 MB/s per camera (about 1.08 GB/s for two cameras). The recorder first
+spools raw frames to disk, then applies enhancement and creates the MP4 after
+recording stops.
+
+- NVMe SSD with sustained sequential writes of at least 700 MB/s for one
+  camera or 1.3 GB/s for two cameras
+- Free space of about 65 GB per camera for every two minutes, plus space for
+  the final MP4; 1 TB minimum, 2 TB or more recommended for two cameras
+- 32 GB RAM for one camera or 64 GB for two cameras
+- Modern 8-core CPU; hardware video encoding is recommended for faster
+  post-processing, but is not required for capture
+- Sufficient 5GigE NIC bandwidth for each camera
+
+Actual requirements vary with ROI, pixel format, and frame rate. Confirm
+sustained disk throughput before long recordings.
 
 ## Install
 
@@ -52,7 +71,10 @@ python -m pyviewr
 3. **Timer** — choose `Timer: Off` (immediate) or `Timer: 10s`. Applies to Still and Record start. Use **Cancel timer** to abort. Stop is always immediate.
 4. **Still** — saves `camN_YYYYMMDD_HHMMSS_mmm.png` into the save folder.  
    With two cameras, exposure is triggered by a single GigE Action Command.
-5. **Record** / **Stop** — writes `camN_....avi` (MJPG). With two cameras, the start is aligned with an Action Command, then free-run continues.
+5. **Record** / **Stop** — writes `camN_....mp4` (MPEG-4). Raw frames are
+   spooled during recording; enhancement and MP4 encoding run automatically
+   after Stop. With two cameras, the start is aligned with an Action Command,
+   then free-run continues.
 6. **Save folder…** — choose where files are written (stored in `config.json`).
 
 Default save directory: `~/Pictures/Pyviewr/`
