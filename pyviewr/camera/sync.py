@@ -11,7 +11,9 @@ ACTION_GROUP_MASK = 0xFFFFFFFF
 
 
 def _set(camera: Any, name: str, value: Any) -> None:
-    node = getattr(camera, name, None)
+    from pyviewr.camera.manager import _node
+
+    node = _node(camera, name)
     if node is None:
         raise RuntimeError(f"Camera feature not available: {name}")
     node.SetValue(value)
@@ -24,9 +26,12 @@ def configure_action_trigger(camera: Any) -> None:
     _set(camera, "TriggerSource", "Action1")
 
     # SFNC 2.x (ace 2) exposes ActionSelector.
-    if getattr(camera, "ActionSelector", None) is not None:
+    from pyviewr.camera.manager import _node
+
+    selector = _node(camera, "ActionSelector")
+    if selector is not None:
         try:
-            camera.ActionSelector.SetValue(1)
+            selector.SetValue(1)
         except Exception:
             pass
 

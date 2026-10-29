@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import QElapsedTimer, QObject, Qt, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QHBoxLayout,
@@ -21,7 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from pyviewr import config as app_config
-from pyviewr.camera.manager import CameraManager
+from pyviewr.camera.manager import TARGET_FPS, CameraManager, RecordingSummary
 from pyviewr.processing import enhance, sunscreen
 from pyviewr.ui.control_panels import (
     CameraControlPanel,
@@ -39,6 +41,7 @@ class _Bridge(QObject):
     frame = Signal(int, object)
     error = Signal(str)
     device_removed = Signal(int)
+    devices_ready = Signal(object, object)  # list[DeviceInfo] | None, error str | None
 
 
 class MainWindow(QMainWindow):
@@ -54,6 +57,9 @@ class MainWindow(QMainWindow):
         self._bridge.frame.connect(self._on_frame)
         self._bridge.error.connect(self._on_error)
         self._bridge.device_removed.connect(self._on_device_removed)
+        self._bridge.devices_ready.connect(self._on_devices_ready)
+        self._refreshing = False
+        self._closing = False
 
         self._manager = CameraManager(
             on_frame=self._emit_frame,
@@ -66,6 +72,7 @@ class MainWindow(QMainWindow):
 
         self._camera_panel = CameraControlPanel()
         self._camera_panel.feature_changed.connect(self._on_camera_feature)
+        self._camera_panel.target_fps_clicked.connect(self._on_target_fps_clicked)
         self._enhance_panel = EnhanceControlPanel()
         self._enhance_panel.params_changed.connect(self._on_enhance_params)
         self._detect_panel = DetectionControlPanel()
@@ -90,6 +97,12 @@ class MainWindow(QMainWindow):
         self._timer_combo.addItem("Timer: Off", 0)
         self._timer_combo.addItem(f"Timer: {TIMER_SECONDS}s", TIMER_SECONDS)
 
+        self._chk_lossless = QCheckBox("Lossless")
+        self._chk_lossless.setToolTip(
+            "On: FFV1 .mkv (bit-exact, same quality as stills, large files)\n"
+            "Off: MPEG-4 .mp4 (lossy, small files)"
+        )
+
         self._paused = False
         self._last_raw: dict[int, np.ndarray] = {}
         self._frozen_raw: dict[int, np.ndarray] = {}
@@ -108,6 +121,7 @@ class MainWindow(QMainWindow):
             idx = self._timer_combo.findData(TIMER_SECONDS)
         if idx >= 0:
             self._timer_combo.setCurrentIndex(idx)
+        self._chk_lossless.setChecked(app_config.load_lossless_video())
 
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
@@ -125,6 +139,9 @@ class MainWindow(QMainWindow):
             "color: #d32f2f; font-size: 20px; font-weight: bold;"
         )
         self._lbl_recording_time.setVisible(False)
+        # Stays until the next recording so drops can be checked afterwards.
+        self._lbl_last_recording = QLabel("")
+        self._lbl_last_recording.setVisible(False)
         self._recording_elapsed = QElapsedTimer()
         self._recording_timer = QTimer(self)
         self._recording_timer.setInterval(1000)
@@ -155,6 +172,7 @@ class MainWindow(QMainWindow):
         self._btn_save_dir.clicked.connect(self.choose_save_dir)
         self._btn_cancel_timer.clicked.connect(self.cancel_timer)
         self._timer_combo.currentIndexChanged.connect(self._schedule_save_settings)
+        self._chk_lossless.toggled.connect(self._schedule_save_settings)
 
         controls = QHBoxLayout()
         for w in (
@@ -165,6 +183,7 @@ class MainWindow(QMainWindow):
             self._timer_combo,
             self._btn_still,
             self._btn_record,
+            self._chk_lossless,
             self._btn_cancel_timer,
             self._btn_save_dir,
         ):
@@ -198,6 +217,7 @@ class MainWindow(QMainWindow):
         root.addWidget(self._lbl_save)
         root.addWidget(self._lbl_countdown)
         root.addWidget(self._lbl_recording_time)
+        root.addWidget(self._lbl_last_recording)
         root.addLayout(previews, stretch=1)
 
         central = QWidget()
@@ -312,23 +332,60 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.statusBar().showMessage(str(exc), 5000)
             return
+        if name == "AcquisitionFrameRate":
+            info = self._manager.get_feature_info("ExposureTime")
+            if info is not None:
+                self._camera_panel.update_feature("ExposureTime", info)
         self._update_fps_label()
         self._schedule_save_settings()
 
     @Slot()
+    def _on_target_fps_clicked(self) -> None:
+        """Pair the target rate with the longest exposure that sustains it."""
+        try:
+            reachable = self._manager.maximize_exposure_for_frame_rate()
+        except Exception as exc:
+            self.statusBar().showMessage(f"Exposure adjust failed: {exc}", 5000)
+            return
+        info = self._manager.get_feature_info("ExposureTime")
+        if info is not None:
+            self._camera_panel.update_feature("ExposureTime", info)
+        self._update_fps_label()
+        self._schedule_save_settings()
+        if reachable:
+            exposure_ms = info.value / 1000.0 if info is not None else 0.0
+            self.statusBar().showMessage(
+                f"Frame rate set to {TARGET_FPS:g} fps, exposure "
+                f"{exposure_ms:.2f} ms (saved)",
+                4000,
+            )
+        else:
+            resulting = self._manager.get_resulting_fps()
+            self.statusBar().showMessage(
+                f"{TARGET_FPS:g} fps not reachable: camera limit "
+                f"{resulting or 0:.1f} fps (ROI / bandwidth)",
+                8000,
+            )
+
+    @Slot()
     def _update_fps_label(self) -> None:
-        fps = self._manager.get_resulting_fps()
+        try:
+            fps = self._manager.get_resulting_fps()
+        except Exception:
+            fps = None
         self._lbl_fps.setText("FPS: —" if fps is None else f"FPS: {fps:.1f}")
 
     def _load_camera_panel(self) -> None:
         infos = {
             name: self._manager.get_feature_info(name)
-            for name in ("ExposureTime", "Gain", "Gamma")
+            for name in ("AcquisitionFrameRate", "ExposureTime", "Gain", "Gamma")
         }
         self._camera_panel.load_features(infos)
 
     def _apply_saved_camera_features(self) -> None:
         saved = app_config.load_camera_features()
+        if "AcquisitionFrameRate" not in saved:
+            saved = {"AcquisitionFrameRate": TARGET_FPS, **saved}
         for name, value in saved.items():
             try:
                 self._manager.set_feature(name, value)
@@ -346,6 +403,7 @@ class MainWindow(QMainWindow):
         app_config.update_config(
             save_dir=str(self._save_dir),
             timer_seconds=self._timer_delay_seconds(),
+            lossless_video=self._chk_lossless.isChecked(),
             camera=camera,
             enhance=self._enhance_panel.to_dict(),
             detection=self._detect_panel.to_dict(),
@@ -394,6 +452,7 @@ class MainWindow(QMainWindow):
             self._stop_recording_time()
             self._clear_pause()
             self._btn_record.setText("Record")
+            self._chk_lossless.setEnabled(True)
             self._preview0.clear_frame()
             self._preview1.clear_frame()
             self._camera_panel.set_disconnected()
@@ -457,25 +516,64 @@ class MainWindow(QMainWindow):
         elif action == "record":
             self._do_start_recording()
 
-    @Slot()
-    def refresh_devices(self) -> None:
-        try:
-            devices = self._manager.enumerate_devices()
-        except Exception as exc:
-            self._lbl_devices.setText(f"Devices: error — {exc}")
-            return
+    def _show_device_list(self, devices: list) -> None:
         if not devices:
-            self._lbl_devices.setText("Devices: none found")
+            hint = self._manager.gige_unreachable_hint()
+            self._lbl_devices.setText(
+                f"Devices: none reachable — {hint}" if hint else "Devices: none found"
+            )
             return
         text = "; ".join(f"[{d.index}] {d.display_name}" for d in devices)
         self._lbl_devices.setText(f"Devices: {text}")
+
+    @Slot()
+    def refresh_devices(self) -> None:
+        if self._refreshing:
+            return
+        self._refreshing = True
+        self._btn_refresh.setEnabled(False)
+        if not self._manager.is_open:
+            self._btn_connect.setEnabled(False)
+        self._lbl_devices.setText("Devices: scanning…")
+
+        def work() -> None:
+            try:
+                devices = self._manager.enumerate_devices()
+            except Exception as exc:
+                self._bridge.devices_ready.emit(None, str(exc))
+                return
+            self._bridge.devices_ready.emit(devices, None)
+
+        threading.Thread(target=work, name="pyviewr-enum", daemon=True).start()
+
+    @Slot(object, object)
+    def _on_devices_ready(self, devices: object, error: object) -> None:
+        self._refreshing = False
+        self._btn_refresh.setEnabled(True)
+        if not self._manager.is_open:
+            self._btn_connect.setEnabled(True)
+        if self._closing:
+            return
+        if error:
+            self._lbl_devices.setText(f"Devices: error — {error}")
+            return
+        if not isinstance(devices, list):
+            self._lbl_devices.setText("Devices: none found")
+            return
+        self._show_device_list(devices)
 
     @Slot()
     def connect_cameras(self) -> None:
         try:
             devices = self._manager.enumerate_devices()
             if not devices:
-                QMessageBox.warning(self, "Pyviewr", "No cameras found.")
+                hint = self._manager.gige_unreachable_hint(detailed=True)
+                detail = (
+                    "No cameras reachable.\n\n"
+                    + (hint or "pylon found no devices. Check power, cable, and NIC link.")
+                )
+                self._show_device_list([])
+                QMessageBox.warning(self, "Pyviewr", detail)
                 return
             # Open with a stable UVL -> Camera 0 / UVR -> Camera 1 identity,
             # independent of which one happens to enumerate first over USB.
@@ -538,12 +636,14 @@ class MainWindow(QMainWindow):
             # Stop is always immediate (no timer).
             self.cancel_timer()
             try:
-                self._manager.stop_recording()
+                summaries = self._manager.stop_recording()
             except Exception as exc:
                 QMessageBox.critical(self, "Pyviewr", str(exc))
                 return
             self._stop_recording_time()
             self._btn_record.setText("Record")
+            self._chk_lossless.setEnabled(True)
+            self._show_recording_summary(summaries)
             self.statusBar().showMessage("Recording stopped", 3000)
             return
 
@@ -553,11 +653,14 @@ class MainWindow(QMainWindow):
 
     def _do_start_recording(self) -> None:
         try:
-            paths = self._manager.start_recording(self._save_dir)
+            paths = self._manager.start_recording(
+                self._save_dir, lossless=self._chk_lossless.isChecked()
+            )
         except Exception as exc:
             QMessageBox.critical(self, "Pyviewr", str(exc))
             return
         self._btn_record.setText("Stop")
+        self._chk_lossless.setEnabled(False)
         self._recording_elapsed.start()
         self._update_recording_time()
         self._recording_timer.start()
@@ -574,6 +677,33 @@ class MainWindow(QMainWindow):
             f"Recording time: {hours:02d}:{minutes:02d}:{seconds:02d}"
         )
         self._lbl_recording_time.setVisible(True)
+
+    def _show_recording_summary(self, summaries: list[RecordingSummary]) -> None:
+        if not summaries:
+            self._lbl_last_recording.setVisible(False)
+            return
+        problem = False
+        lines = []
+        for s in summaries:
+            if s.camera_dropped is None:
+                dropped = "dropped: n/a"
+            else:
+                dropped = f"dropped: {s.camera_dropped}"
+                problem |= s.camera_dropped > 0
+            problem |= s.disk_waits > 0 or s.incomplete > 0
+            underruns = "n/a" if s.buffer_underruns is None else s.buffer_underruns
+            packet = "n/a" if s.packet_size is None else s.packet_size
+            lines.append(
+                f"Last recording cam{s.slot}: {s.fps:.1f} fps, {s.frames} frames, "
+                f"{dropped}, disk waits: {s.disk_waits}, "
+                f"incomplete: {s.incomplete}, no buffer: {underruns}, "
+                f"packet: {packet}"
+            )
+        self._lbl_last_recording.setText("\n".join(lines))
+        self._lbl_last_recording.setStyleSheet(
+            "color: #d32f2f; font-weight: bold;" if problem else ""
+        )
+        self._lbl_last_recording.setVisible(True)
 
     def _stop_recording_time(self) -> None:
         self._recording_timer.stop()
@@ -596,6 +726,7 @@ class MainWindow(QMainWindow):
         self._flush_settings()
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        self._closing = True
         self.cancel_timer()
         self._flush_settings()
         try:

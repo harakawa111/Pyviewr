@@ -18,11 +18,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from pyviewr.camera.manager import FeatureInfo
+from pyviewr.camera.manager import TARGET_FPS, FeatureInfo
 from pyviewr.processing.enhance import EnhanceParams
 from pyviewr.processing.sunscreen import DetectionParams
 
 _SLIDER_STEPS = 1000
+_FPS_SLIDER_MAX = 1000.0
 
 
 class _FeatureRow(QWidget):
@@ -36,6 +37,9 @@ class _FeatureRow(QWidget):
         self._fmt = fmt
         self._min = 0.0
         self._max = 1.0
+        # Exact value last set programmatically or by the slider.  The slider
+        # only has _SLIDER_STEPS positions, so reading it back would quantize.
+        self._value = 0.0
         self._updating = False
 
         self._slider = QSlider(Qt.Orientation.Horizontal)
@@ -58,13 +62,22 @@ class _FeatureRow(QWidget):
         self._max = max(maximum, minimum + 1e-9)
         if self._log:
             self._min = max(self._min, 1e-9)
-        self._updating = True
-        self._slider.setValue(self._to_step(value))
-        self._updating = False
-        self._label.setText(self._fmt(value))
+        self._set_exact(value)
 
     def value(self) -> float:
-        return self._from_step(self._slider.value())
+        return self._value
+
+    def apply_value(self, value: float) -> None:
+        """Move the slider to value and notify listeners."""
+        self._set_exact(value)
+        self.changed.emit(self._value)
+
+    def _set_exact(self, value: float) -> None:
+        self._value = min(max(value, self._min), self._max)
+        self._updating = True
+        self._slider.setValue(self._to_step(self._value))
+        self._updating = False
+        self._label.setText(self._fmt(self._value))
 
     def _to_step(self, value: float) -> int:
         value = min(max(value, self._min), self._max)
@@ -81,10 +94,11 @@ class _FeatureRow(QWidget):
         return self._min + (self._max - self._min) * t
 
     def _on_slider(self, step: int) -> None:
-        value = self._from_step(step)
-        self._label.setText(self._fmt(value))
-        if not self._updating:
-            self.changed.emit(value)
+        if self._updating:
+            return
+        self._value = self._from_step(step)
+        self._label.setText(self._fmt(self._value))
+        self.changed.emit(self._value)
 
 
 def _fmt_exposure(us: float) -> str:
@@ -93,28 +107,67 @@ def _fmt_exposure(us: float) -> str:
     return f"{us:.0f} µs"
 
 
+def _slider_maximum(name: str, maximum: float) -> float:
+    if name == "ExposureTime":
+        # Cap at 1 s so the slider stays usable for live preview.
+        return min(maximum, 1_000_000.0)
+    if name == "AcquisitionFrameRate":
+        # Basler reports a huge AcquisitionFrameRate maximum; uncapped, the
+        # slider cannot resolve normal rates such as 67 fps.
+        return min(maximum, _FPS_SLIDER_MAX)
+    return maximum
+
+
 class CameraControlPanel(QGroupBox):
-    """Live sliders for ExposureTime / Gain / Gamma (applied to all cameras)."""
+    """Live sliders for frame rate / ExposureTime / Gain / Gamma (all cameras)."""
 
     feature_changed = Signal(str, float)
+    target_fps_clicked = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__("Camera settings", parent)
         self._rows: dict[str, _FeatureRow] = {
+            "AcquisitionFrameRate": _FeatureRow(
+                log_scale=True, fmt=lambda v: f"{v:.1f} fps"
+            ),
             "ExposureTime": _FeatureRow(log_scale=True, fmt=_fmt_exposure),
             "Gain": _FeatureRow(log_scale=False, fmt=lambda v: f"{v:.1f} dB"),
             "Gamma": _FeatureRow(log_scale=False, fmt=lambda v: f"{v:.2f}"),
         }
+        self._btn_target_fps = QPushButton(f"{TARGET_FPS:g} FPS")
+        self._btn_target_fps.setToolTip(
+            f"Set acquisition to {TARGET_FPS:g} fps. The value is saved and "
+            "restored on the next connect."
+        )
+        self._btn_target_fps.clicked.connect(self._apply_target_fps)
+
+        fps_row = QWidget()
+        fps_layout = QHBoxLayout(fps_row)
+        fps_layout.setContentsMargins(0, 0, 0, 0)
+        fps_layout.addWidget(self._rows["AcquisitionFrameRate"], stretch=1)
+        fps_layout.addWidget(self._btn_target_fps)
+
         form = QFormLayout(self)
+        form.addRow("Frame rate", fps_row)
         form.addRow("Exposure", self._rows["ExposureTime"])
         form.addRow("Gain", self._rows["Gain"])
         form.addRow("Gamma", self._rows["Gamma"])
+        self._rows["AcquisitionFrameRate"].setToolTip(
+            "Camera acquisition rate. Exposure is capped so this rate stays reachable."
+        )
 
         for name, row in self._rows.items():
             row.changed.connect(
                 lambda value, n=name: self.feature_changed.emit(n, value)
             )
         self.setEnabled(False)
+
+    def _apply_target_fps(self) -> None:
+        row = self._rows["AcquisitionFrameRate"]
+        if not row.isEnabled():
+            return
+        row.apply_value(TARGET_FPS)
+        self.target_fps_clicked.emit()
 
     def load_features(self, infos: dict[str, FeatureInfo | None]) -> None:
         """Populate slider ranges from camera values; enable available rows."""
@@ -124,14 +177,22 @@ class CameraControlPanel(QGroupBox):
             if info is None:
                 row.setEnabled(False)
                 continue
-            maximum = info.maximum
-            if name == "ExposureTime":
-                # Cap at 1 s so the slider stays usable for live preview.
-                maximum = min(maximum, 1_000_000.0)
+            maximum = _slider_maximum(name, info.maximum)
             row.set_range(info.minimum, maximum, info.value)
             row.setEnabled(True)
             any_available = True
+        self._btn_target_fps.setEnabled(
+            infos.get("AcquisitionFrameRate") is not None
+        )
         self.setEnabled(any_available)
+
+    def update_feature(self, name: str, info: FeatureInfo) -> None:
+        """Refresh one slider's range and value without emitting feature_changed."""
+        row = self._rows.get(name)
+        if row is None:
+            return
+        maximum = _slider_maximum(name, info.maximum)
+        row.set_range(info.minimum, maximum, info.value)
 
     def set_disconnected(self) -> None:
         self.setEnabled(False)

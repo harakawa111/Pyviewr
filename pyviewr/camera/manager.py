@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import fcntl
+import ipaddress
+import socket
+import struct
+import subprocess
 import threading
 import time
 from dataclasses import dataclass
@@ -30,7 +35,16 @@ DeviceRemovedCallback = Callable[[int], None]
 
 # GenICam auto-function node that must be "Off" before manual writes.
 _AUTO_NODE = {"ExposureTime": "ExposureAuto", "Gain": "GainAuto"}
+_FPS_VALUE_NODES = ("AcquisitionFrameRate", "AcquisitionFrameRateAbs")
+TARGET_FPS = 67.0
 _PREVIEW_FPS = 10.0
+# Exposure headroom inside one frame period (µs) and allowed shortfall of
+# ResultingFrameRate versus the requested rate.
+_EXPOSURE_MARGIN_US = 100.0
+_FPS_TOLERANCE = 0.995
+_BASLER_OUI = "00:30:53"
+_SIOCGIFADDR = 0x8915
+_SIOCGIFNETMASK = 0x891B
 
 
 @dataclass(frozen=True)
@@ -39,6 +53,24 @@ class DeviceInfo:
     model: str
     serial: str
     display_name: str
+
+
+@dataclass(frozen=True)
+class RecordingSummary:
+    slot: int
+    frames: int
+    fps: float
+    # Times capture waited for the disk spool (disk too slow).
+    disk_waits: int
+    # Frames the camera sent but the host missed (BlockID gaps); None if the
+    # camera does not report BlockID.
+    camera_dropped: int | None
+    # Frames that arrived with missing packets (network).
+    incomplete: int
+    # Frames discarded because no pylon buffer was free (host too slow);
+    # None if the stream grabber does not report it.
+    buffer_underruns: int | None
+    packet_size: int | None
 
 
 @dataclass(frozen=True)
@@ -57,24 +89,150 @@ def _require_pylon() -> None:
         )
 
 
+def _node(cam: object, name: str):
+    """Return a GenICam node, or None if it does not exist.
+
+    pypylon InstantCamera.__getattr__ raises LogicalErrorException for missing
+    nodes instead of AttributeError, so getattr(..., None) is not safe.
+    """
+    try:
+        return cam.GetNodeMap().GetNode(name)
+    except Exception:
+        return None
+
+
 def _is_physically_removed_message(message: str) -> bool:
     return "physically removed" in message.lower()
 
 
+_UNDERRUN_STAT = "Statistic_Buffer_Underrun_Count"
+
+
+def _stream_stat(cam: object, name: str) -> int | None:
+    try:
+        return int(cam.GetStreamGrabberNodeMap().GetNode(name).GetValue())
+    except Exception:
+        return None
+
+
+def _block_id(result) -> int | None:
+    try:
+        return int(result.BlockID)
+    except Exception:
+        return None
+
+
 def array_from_grab(result) -> np.ndarray:
-    """Convert a pylon grab result to a contiguous uint8 grayscale image."""
+    """Convert a pylon grab result to a contiguous uint8 grayscale image.
+
+    GrabResult.Array is a view into pylon memory.  Copy before Release()
+    so later preview / spool code does not use a dangling buffer.
+    """
     img = result.Array
     if img.ndim == 3:
         # Rare for this UV mono camera; take first channel.
         img = img[:, :, 0]
     if img.dtype == np.uint8:
-        return np.ascontiguousarray(img)
+        return np.array(img, dtype=np.uint8, copy=True, order="C")
     # Mono10/12/16 -> display/save as uint8 by simple scale.
     info = np.iinfo(img.dtype)
     if info.max <= 0:
         return np.zeros(img.shape, dtype=np.uint8)
     scaled = (img.astype(np.float32) * (255.0 / float(info.max))).clip(0, 255)
     return np.ascontiguousarray(scaled.astype(np.uint8))
+
+
+def _norm_mac(mac: str) -> str:
+    hex_digits = "".join(c for c in mac.upper() if c in "0123456789ABCDEF")
+    if len(hex_digits) != 12:
+        return mac.strip().upper()
+    return ":".join(hex_digits[i : i + 2] for i in range(0, 12, 2))
+
+
+def _mac_oui(mac: str) -> str:
+    return _norm_mac(mac)[:8]
+
+
+def _iface_ipv4(name: str) -> ipaddress.IPv4Interface | None:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        ifreq = struct.pack("256s", name.encode("utf-8")[:15])
+        addr = socket.inet_ntoa(fcntl.ioctl(sock, _SIOCGIFADDR, ifreq)[20:24])
+        mask = socket.inet_ntoa(fcntl.ioctl(sock, _SIOCGIFNETMASK, ifreq)[20:24])
+        prefix = ipaddress.IPv4Network(f"0.0.0.0/{mask}").prefixlen
+        return ipaddress.IPv4Interface(f"{addr}/{prefix}")
+    except OSError:
+        pass
+    finally:
+        sock.close()
+    try:
+        out = subprocess.check_output(
+            ["ip", "-4", "-o", "addr", "show", "dev", name],
+            text=True,
+            timeout=1,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for part in out.split():
+        if "/" in part and part[0].isdigit():
+            try:
+                return ipaddress.IPv4Interface(part)
+            except ValueError:
+                continue
+    return None
+
+
+def _default_route_nics() -> set[str]:
+    nics: set[str] = set()
+    try:
+        lines = Path("/proc/net/route").read_text(encoding="utf-8").splitlines()[1:]
+    except OSError:
+        return nics
+    for line in lines:
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == "00000000":
+            nics.add(parts[0])
+    return nics
+
+
+def _nic_mac(name: str) -> str:
+    path = Path("/sys/class/net") / name / "address"
+    try:
+        return _norm_mac(path.read_text(encoding="utf-8").strip())
+    except OSError:
+        return ""
+
+
+def _basler_arp_neighbors() -> list[tuple[str, str, str]]:
+    """Return (ip, mac, nic) for Basler MACs in the ARP table."""
+    path = Path("/proc/net/arp")
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()[1:]
+    except OSError:
+        return []
+    out: list[tuple[str, str, str]] = []
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 6:
+            continue
+        ip, _hw, flags, mac, _mask, nic = parts[:6]
+        if flags == "0x0" or mac in ("00:00:00:00:00:00", "*"):
+            continue
+        if _mac_oui(mac) != _BASLER_OUI:
+            continue
+        out.append((ip, _norm_mac(mac), nic))
+    return out
+
+
+def _device_str(device: object, getter: str) -> str:
+    available = getattr(device, getter.replace("Get", "Is") + "Available", None)
+    try:
+        if callable(available) and not available():
+            return ""
+        fn = getattr(device, getter)
+        return str(fn() or "")
+    except Exception:
+        return ""
 
 
 class CameraManager:
@@ -101,6 +259,10 @@ class CameraManager:
         self._recorders: dict[int, VideoRecorder] = {}
         self._lock = threading.Lock()
         self._last_preview_at: dict[int, float] = {}
+        self._last_block_id: dict[int, int] = {}
+        self._dropped: dict[int, int | None] = {}
+        self._incomplete: dict[int, int] = {}
+        self._underruns_at_start: dict[int, int | None] = {}
         self._enhance_params = EnhanceParams()
 
     def set_enhance_params(self, params: EnhanceParams) -> None:
@@ -118,6 +280,8 @@ class CameraManager:
 
     def enumerate_devices(self) -> list[DeviceInfo]:
         _require_pylon()
+        if not self._cameras:
+            self._recover_gige_subnet()
         devices = self._tl_factory.EnumerateDevices()
         out: list[DeviceInfo] = []
         for i, di in enumerate(devices):
@@ -126,6 +290,242 @@ class CameraManager:
             name = di.GetFriendlyName() or f"{model} ({serial})"
             out.append(DeviceInfo(i, model, serial, name))
         return out
+
+    def _camera_nics(self) -> list[str]:
+        """NICs dedicated to Basler cameras (OUI 00:30:53) that have link."""
+        nics = [
+            name
+            for name in self._wired_nics_with_carrier()
+            if _mac_oui(_nic_mac(name)) == _BASLER_OUI
+        ]
+        if nics:
+            return nics
+        skip = _default_route_nics()
+        return [
+            name for name in self._wired_nics_with_carrier() if name not in skip
+        ]
+
+    def _pick_force_ip(
+        self, iface: ipaddress.IPv4Interface, used: set[str], preferred: str | None
+    ) -> str | None:
+        used.add(str(iface.ip))
+        net = iface.network
+
+        def _ok(addr: ipaddress.IPv4Address) -> bool:
+            s = str(addr)
+            return (
+                addr in net
+                and addr != net.network_address
+                and addr != net.broadcast_address
+                and s not in used
+            )
+
+        if preferred:
+            try:
+                cand = ipaddress.IPv4Address(preferred)
+            except ValueError:
+                cand = None
+            if cand is not None and _ok(cand):
+                return str(cand)
+            try:
+                host = int(preferred.rsplit(".", 1)[1])
+            except ValueError:
+                host = None
+            if host is not None:
+                cand = ipaddress.IPv4Address(int(net.network_address) + host)
+                if _ok(cand):
+                    return str(cand)
+        three = ipaddress.IPv4Address(int(net.network_address) + 3)
+        if _ok(three):
+            return str(three)
+        for host_ip in net.hosts():
+            if _ok(host_ip):
+                return str(host_ip)
+        return None
+
+    def _recover_gige_subnet(self) -> None:
+        """ForceIP cameras that are on the wire but not on the NIC subnet.
+
+        pylon EnumerateDevices hides GigE cameras whose IP is not in the
+        adapter subnet.  This lab's 5GigE NIC is 192.168.10.2/24 while the
+        camera often stays on 192.168.5.3 / 192.168.9.3.
+        """
+        nics = self._camera_nics()
+        if not nics or pylon is None:
+            return
+        nic_ifaces: dict[str, ipaddress.IPv4Interface] = {}
+        for nic in nics:
+            iface = _iface_ipv4(nic)
+            if iface is not None:
+                nic_ifaces[nic] = iface
+        if not nic_ifaces:
+            return
+
+        gige = None
+        try:
+            gige = self._tl_factory.CreateTl("BaslerGigE")
+        except Exception:
+            return
+        try:
+            try:
+                all_devs = list(gige.EnumerateAllDevices())
+            except Exception:
+                all_devs = []
+            found: dict[str, tuple[str, str | None, str | None]] = {}
+            # mac -> (nic, current_ip, mask)
+            for di in all_devs:
+                mac = _norm_mac(_device_str(di, "GetMacAddress"))
+                if not mac:
+                    continue
+                ip = _device_str(di, "GetIpAddress")
+                nic = self._match_device_nic(di, nic_ifaces)
+                found[mac] = (nic, ip or None, _device_str(di, "GetSubnetMask") or None)
+            for ip, mac, nic in _basler_arp_neighbors():
+                if mac not in found and nic in nic_ifaces:
+                    found[mac] = (nic, ip, None)
+
+            used = {str(iface.ip) for iface in nic_ifaces.values()}
+            changed = False
+            for mac, (nic, current_ip, _mask) in found.items():
+                iface = nic_ifaces.get(nic) or next(iter(nic_ifaces.values()))
+                if current_ip:
+                    try:
+                        if ipaddress.IPv4Address(current_ip) in iface.network:
+                            continue
+                    except ValueError:
+                        pass
+                new_ip = self._pick_force_ip(iface, used, current_ip)
+                if new_ip is None:
+                    continue
+                used.add(new_ip)
+                mask = str(iface.network.netmask)
+                try:
+                    gige.ForceIp(mac, new_ip, mask, "0.0.0.0")
+                    changed = True
+                except Exception:
+                    try:
+                        gige.ForceIp(
+                            mac.replace(":", ""), new_ip, mask, "0.0.0.0"
+                        )
+                        changed = True
+                    except Exception:
+                        pass
+            if changed:
+                time.sleep(0.4)
+        finally:
+            try:
+                self._tl_factory.ReleaseTl(gige)
+            except Exception:
+                pass
+
+    def _match_device_nic(
+        self,
+        device: object,
+        nic_ifaces: dict[str, ipaddress.IPv4Interface],
+    ) -> str:
+        iface_addr = _device_str(device, "GetInterface")
+        for nic, iface in nic_ifaces.items():
+            if iface_addr == nic or iface_addr == str(iface.ip):
+                return nic
+        return next(iter(nic_ifaces))
+
+    @staticmethod
+    def _rp_filter_nics() -> list[str]:
+        """Return interface names whose IPv4 rp_filter is not Off."""
+        conf = Path("/proc/sys/net/ipv4/conf")
+        if not conf.is_dir():
+            return []
+        blocked: list[str] = []
+        for name in ("all", "default"):
+            path = conf / name / "rp_filter"
+            try:
+                if int(path.read_text().strip()) != 0:
+                    blocked.append(name)
+            except (OSError, ValueError):
+                pass
+        for path in sorted(conf.glob("*/rp_filter")):
+            nic = path.parent.name
+            if nic in ("all", "default", "lo"):
+                continue
+            try:
+                if int(path.read_text().strip()) != 0:
+                    blocked.append(nic)
+            except (OSError, ValueError):
+                pass
+        return blocked
+
+    @staticmethod
+    def _wired_nics_with_carrier() -> list[str]:
+        """Ethernet interfaces that currently have link, skipping Wi-Fi."""
+        sys_net = Path("/sys/class/net")
+        if not sys_net.is_dir():
+            return []
+        nics: list[str] = []
+        for nic_dir in sorted(sys_net.iterdir()):
+            if nic_dir.name == "lo" or (nic_dir / "wireless").exists():
+                continue
+            try:
+                if (nic_dir / "type").read_text().strip() != "1":
+                    continue
+                if (nic_dir / "carrier").read_text().strip() != "1":
+                    continue
+            except OSError:
+                continue
+            nics.append(nic_dir.name)
+        return nics
+
+    @classmethod
+    def gige_unreachable_hint(cls, *, detailed: bool = False) -> str | None:
+        """Explain common Linux GigE discovery failures without spawning pylon tools."""
+        arp = _basler_arp_neighbors()
+        blocked = cls._rp_filter_nics()
+        wired = cls._wired_nics_with_carrier()
+        if arp:
+            ip, mac, nic = arp[0]
+            iface = _iface_ipv4(nic)
+            nic_ip = str(iface.ip) if iface else "?"
+            extra = f" (+{len(arp) - 1} more)" if len(arp) > 1 else ""
+            if not detailed:
+                return (
+                    f"Basler {mac} is on {nic} at {ip}{extra}, "
+                    f"but the NIC is {nic_ip} (different subnet)"
+                )
+            return (
+                f"Basler camera {mac} answers on {nic} at {ip}{extra}, "
+                f"but adapter {nic} is {nic_ip}.\n\n"
+                "Pyviewr should ForceIP the camera onto the NIC subnet on Refresh. "
+                "If it still does not appear, set the NIC to the camera subnet "
+                f"or the camera to {iface.network if iface else 'the NIC subnet'}."
+            )
+        if blocked:
+            nics = [n for n in blocked if n not in ("all", "default")] or wired
+            nic = nics[0] if nics else "enp9s0"
+            if not detailed:
+                return "rp_filter is dropping GigE replies"
+            commands = [
+                "sudo sysctl -w net.ipv4.conf.all.rp_filter=0",
+                "sudo sysctl -w net.ipv4.conf.default.rp_filter=0",
+                f"sudo sysctl -w net.ipv4.conf.{nic}.rp_filter=0",
+            ]
+            for extra in nics[1:]:
+                commands.append(
+                    f"sudo sysctl -w net.ipv4.conf.{extra}.rp_filter=0"
+                )
+            return (
+                "Linux rp_filter is dropping GigE replies.\n\n"
+                "Run:\n"
+                + "\n".join(commands)
+                + "\n\nThen power-cycle the camera and click Refresh."
+            )
+        if not detailed:
+            return None
+        if wired:
+            return (
+                "pylon found no devices. Wired link is up on "
+                + ", ".join(wired)
+                + ". Check camera power, subnet, and Jumbo frames."
+            )
+        return "pylon found no devices. Check power, cable, and NIC link."
 
     @property
     def camera_count(self) -> int:
@@ -170,6 +570,8 @@ class CameraManager:
                 except (genicam.GenericException, AttributeError):
                     pass
                 sync_mod.configure_free_run(cam)
+                self._configure_frame_rate(cam, TARGET_FPS)
+                self._configure_packet_size(cam)
                 self._cameras.append(cam)
                 opened.append(
                     DeviceInfo(
@@ -183,6 +585,41 @@ class CameraManager:
             self.close()
             raise
         return opened
+
+    def _configure_packet_size(self, cam: object) -> None:
+        """Match GevSCPSPacketSize to the MTU of the NIC the camera is on.
+
+        Jumbo packets cut the per-packet load ~6x at 2840x2840 / 67 fps.  The
+        camera default (1500) is kept if the NIC cannot be determined, since a
+        packet larger than the NIC MTU would stop all frames from arriving.
+        """
+        node = _node(cam, "GevSCPSPacketSize")
+        ip_node = _node(cam, "GevCurrentIPAddress")
+        if node is None or ip_node is None:
+            return
+        try:
+            cam_ip = ipaddress.IPv4Address(int(ip_node.GetValue()))
+        except Exception:
+            return
+        mtu = None
+        for nic in self._wired_nics_with_carrier():
+            iface = _iface_ipv4(nic)
+            if iface is not None and cam_ip in iface.network:
+                try:
+                    mtu = int((Path("/sys/class/net") / nic / "mtu").read_text())
+                except (OSError, ValueError):
+                    return
+                break
+        if mtu is None:
+            return
+        try:
+            inc = max(int(node.GetInc()), 1)
+            size = min(mtu, int(node.GetMax()))
+            size = max(size - size % inc, int(node.GetMin()))
+            node.SetValue(size)
+        except Exception as exc:
+            if self._on_error is not None:
+                self._on_error(f"Packet size not set: {exc}")
 
     def _resolve_slot_order(
         self, devices: list[DeviceInfo]
@@ -280,13 +717,45 @@ class CameraManager:
         except Exception:
             pass
 
-    # ----- camera features (exposure / gain / gamma) ------------------------------
+    # ----- camera features (frame rate / exposure / gain / gamma) -----------------
+
+    @staticmethod
+    def _frame_rate_node(cam: object):
+        for name in _FPS_VALUE_NODES:
+            node = _node(cam, name)
+            if node is not None:
+                return node
+        return None
+
+    @staticmethod
+    def _enable_frame_rate(cam: object) -> None:
+        node = _node(cam, "AcquisitionFrameRateEnable")
+        if node is None:
+            return
+        try:
+            if not node.GetValue():
+                node.SetValue(True)
+        except Exception:
+            pass
+
+    def _configure_frame_rate(self, cam: object, fps: float) -> None:
+        """Limit free-run acquisition to fps (requires ExposureTime ≤ 1/fps)."""
+        self._enable_frame_rate(cam)
+        node = self._frame_rate_node(cam)
+        if node is None:
+            return
+        clamped = min(max(float(fps), float(node.GetMin())), float(node.GetMax()))
+        node.SetValue(clamped)
 
     def get_feature_info(self, name: str) -> FeatureInfo | None:
         """Read value + range of a float feature from the first camera."""
         if not self._cameras:
             return None
-        node = getattr(self._cameras[0], name, None)
+        node = (
+            self._frame_rate_node(self._cameras[0])
+            if name == "AcquisitionFrameRate"
+            else _node(self._cameras[0], name)
+        )
         if node is None:
             return None
         try:
@@ -299,17 +768,26 @@ class CameraManager:
         except Exception:
             return None
 
-    def get_resulting_fps(self) -> float | None:
-        """Read the camera's achievable frame rate under current settings.
-
-        Reflects ExposureTime / ROI / bandwidth right now (no AcquisitionFrameRate
-        limit is set anywhere in this app, so this is effectively the max fps).
-        """
-        if not self._cameras:
+    def _target_fps(self, cam: object) -> float | None:
+        node = self._frame_rate_node(cam)
+        if node is None:
             return None
-        cam = self._cameras[0]
+        try:
+            return float(node.GetValue())
+        except Exception:
+            return None
+
+    def _exposure_cap(self, cam: object) -> float | None:
+        """Longest ExposureTime (µs) that fits one frame period at the set rate."""
+        fps = self._target_fps(cam)
+        if fps is None or fps <= 0:
+            return None
+        return 1_000_000.0 / fps - _EXPOSURE_MARGIN_US
+
+    @staticmethod
+    def _resulting_fps(cam: object) -> float | None:
         for name in ("ResultingFrameRate", "ResultingFrameRateAbs"):
-            node = getattr(cam, name, None)
+            node = _node(cam, name)
             if node is None:
                 continue
             try:
@@ -317,6 +795,65 @@ class CameraManager:
             except Exception:
                 continue
         return None
+
+    def maximize_exposure_for_frame_rate(self) -> bool:
+        """Set ExposureTime on every camera to the longest value that still
+        reaches the set frame rate.
+
+        Returns False when a camera cannot reach the rate (ROI / readout /
+        bandwidth limit); its exposure is then left at one frame period.
+        """
+        reachable = True
+        for cam in self._cameras:
+            target = self._target_fps(cam)
+            node = _node(cam, "ExposureTime")
+            if target is None or node is None:
+                continue
+            auto_node = _node(cam, "ExposureAuto")
+            if auto_node is not None:
+                try:
+                    if auto_node.GetValue() != "Off":
+                        auto_node.SetValue("Off")
+                except Exception:
+                    pass
+            minimum = float(node.GetMin())
+            cap = self._exposure_cap(cam)
+            if cap is None:
+                continue
+            exposure = min(max(cap, minimum), float(node.GetMax()))
+            node.SetValue(exposure)
+            # The frame period also includes sensor overhead the cap does not
+            # know about, so follow ResultingFrameRate down.  Stop (and keep
+            # the brighter exposure) once shortening no longer helps: the
+            # limit is then readout / bandwidth, not exposure.
+            resulting = self._resulting_fps(cam)
+            for _ in range(10):
+                if resulting is None or resulting >= target * _FPS_TOLERANCE:
+                    break
+                if exposure <= minimum:
+                    reachable = False
+                    break
+                shorter = max(exposure * resulting / target * 0.98, minimum)
+                node.SetValue(shorter)
+                improved = self._resulting_fps(cam)
+                if improved is None or improved <= resulting * 1.001:
+                    node.SetValue(exposure)
+                    reachable = False
+                    break
+                exposure, resulting = shorter, improved
+            else:
+                reachable = False
+        return reachable
+
+    def get_resulting_fps(self) -> float | None:
+        """Read the camera's achievable frame rate under current settings.
+
+        Follows AcquisitionFrameRate (67 by default) plus ExposureTime / ROI /
+        bandwidth limits.
+        """
+        if not self._cameras:
+            return None
+        return self._resulting_fps(self._cameras[0])
 
     def set_feature(self, name: str, value: float) -> None:
         """Set a float feature on all open cameras (clamped to valid range).
@@ -331,14 +868,18 @@ class CameraManager:
             try:
                 auto_name = _AUTO_NODE.get(name)
                 if auto_name is not None:
-                    auto_node = getattr(cam, auto_name, None)
+                    auto_node = _node(cam, auto_name)
                     if auto_node is not None:
                         try:
                             if auto_node.GetValue() != "Off":
                                 auto_node.SetValue("Off")
                         except Exception:
                             pass
-                node = getattr(cam, name, None)
+                if name == "AcquisitionFrameRate":
+                    self._enable_frame_rate(cam)
+                    node = self._frame_rate_node(cam)
+                else:
+                    node = _node(cam, name)
                 if node is None:
                     raise RuntimeError(f"feature not available: {name}")
                 clamped = min(max(value, float(node.GetMin())), float(node.GetMax()))
@@ -357,6 +898,8 @@ class CameraManager:
             return
         self._device_removed.clear()
         self._last_preview_at.clear()
+        # BlockID may restart with a new grab session.
+        self._last_block_id.clear()
         for cam in self._cameras:
             sync_mod.configure_free_run(cam)
             if not cam.IsGrabbing():
@@ -424,10 +967,17 @@ class CameraManager:
                 grab = cam.RetrieveResult(200, pylon.TimeoutHandling_Return)
                 with grab:
                     if not grab.GrabSucceeded():
+                        if self._recording:
+                            self._incomplete[index] = (
+                                self._incomplete.get(index, 0) + 1
+                            )
                         continue
                     frame = array_from_grab(grab)
+                    block_id = _block_id(grab)
                 with self._lock:
                     rec = self._recorders.get(index)
+                if rec is not None:
+                    self._count_dropped(index, block_id)
                 # Preview is intentionally throttled.  During recording the
                 # acquisition threads must not flood the Qt event queue with
                 # one signal per camera frame.  Emit it before the disk
@@ -456,6 +1006,17 @@ class CameraManager:
                 if self._on_error is not None:
                     self._on_error(f"Camera {self._slot(index)}: {exc}")
                 time.sleep(0.05)
+
+    def _count_dropped(self, index: int, block_id: int | None) -> None:
+        if block_id is None or block_id == 0:
+            self._dropped[index] = None
+            return
+        last = self._last_block_id.get(index)
+        self._last_block_id[index] = block_id
+        dropped = self._dropped.get(index)
+        # A smaller id means the counter wrapped; skip that interval.
+        if last is not None and dropped is not None and block_id > last:
+            self._dropped[index] = dropped + block_id - last - 1
 
     # ----- still -----------------------------------------------------------------
 
@@ -543,12 +1104,17 @@ class CameraManager:
     # ----- video -----------------------------------------------------------------
 
     def start_recording(
-        self, save_dir: Path, fps: float = DEFAULT_VIDEO_FPS
+        self,
+        save_dir: Path,
+        fps: float | None = None,
+        lossless: bool = False,
     ) -> list[Path]:
         if not self._cameras:
             raise RuntimeError("No cameras open.")
         if self._recording:
             raise RuntimeError("Already recording.")
+        if fps is None:
+            fps = self.get_resulting_fps() or DEFAULT_VIDEO_FPS
 
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
@@ -565,16 +1131,20 @@ class CameraManager:
             h = int(cam.Height.GetValue())
             sizes.append((w, h))
 
+        ext = "mkv" if lossless else "mp4"
         paths: list[Path] = []
         with self._lock:
             self._recorders.clear()
+            self._dropped = {i: 0 for i in range(len(sizes))}
+            self._incomplete = {i: 0 for i in range(len(sizes))}
             for i, (w, h) in enumerate(sizes):
-                path = save_dir / f"cam{self._slot(i)}_{stamp}.mp4"
+                path = save_dir / f"cam{self._slot(i)}_{stamp}.{ext}"
                 self._recorders[i] = VideoRecorder(
                     path,
                     (w, h),
                     fps=fps,
                     frame_processor=self._frame_for_save,
+                    lossless=lossless,
                     on_complete=lambda path, index=i: self._video_postprocess_done(
                         index, path
                     ),
@@ -593,6 +1163,10 @@ class CameraManager:
             # connected preview normally uses LatestImageOnly.
             self.stop_grabbing()
             self.start_grabbing()
+        self._underruns_at_start = {
+            i: _stream_stat(cam, _UNDERRUN_STAT)
+            for i, cam in enumerate(self._cameras)
+        }
         return paths
 
     def _restart_free_run_aligned(self) -> None:
@@ -635,11 +1209,28 @@ class CameraManager:
                 f"Camera {self._slot(index)}: video post-processing failed: {message}"
             )
 
-    def stop_recording(self) -> None:
+    def stop_recording(self) -> list[RecordingSummary]:
         with self._lock:
             recording = self._recording or bool(self._recorders)
         if not recording:
-            return
+            return []
+
+        underruns: dict[int, int | None] = {}
+        for i, cam in enumerate(self._cameras):
+            end = _stream_stat(cam, _UNDERRUN_STAT)
+            start = self._underruns_at_start.get(i)
+            if end is None or start is None:
+                underruns[i] = None
+            else:
+                # Counter may restart with a new grab session.
+                underruns[i] = end - start if end >= start else end
+        packet_sizes: dict[int, int | None] = {}
+        for i, cam in enumerate(self._cameras):
+            node = _node(cam, "GevSCPSPacketSize")
+            try:
+                packet_sizes[i] = int(node.GetValue()) if node is not None else None
+            except Exception:
+                packet_sizes[i] = None
 
         was_grabbing = self._grabbing
         if was_grabbing:
@@ -654,15 +1245,22 @@ class CameraManager:
             self._recording = False
 
         first_error: Exception | None = None
+        summaries: list[RecordingSummary] = []
         for index, rec in recorders:
             try:
                 rec.close(ended_at)
-                if rec.backpressure_events and self._on_error is not None:
-                    self._on_error(
-                        f"Camera {self._slot(index)}: disk spool was busy "
-                        f"({rec.backpressure_events} waits); capture may be slower "
-                        "than the camera rate."
+                summaries.append(
+                    RecordingSummary(
+                        slot=self._slot(index),
+                        frames=rec.frame_count,
+                        fps=rec.measured_fps(ended_at),
+                        disk_waits=rec.backpressure_events,
+                        camera_dropped=self._dropped.get(index),
+                        incomplete=self._incomplete.get(index, 0),
+                        buffer_underruns=underruns.get(index),
+                        packet_size=packet_sizes.get(index),
                     )
+                )
             except Exception as exc:
                 if first_error is None:
                     first_error = exc
@@ -671,3 +1269,4 @@ class CameraManager:
             self.start_grabbing()
         if first_error is not None:
             raise first_error
+        return summaries

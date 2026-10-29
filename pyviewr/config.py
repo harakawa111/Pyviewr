@@ -9,7 +9,7 @@ from typing import Any
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
 DEFAULT_SAVE_DIR = Path.home() / "Pictures" / "Pyviewr"
 
-_CAMERA_KEYS = ("ExposureTime", "Gain", "Gamma")
+_CAMERA_KEYS = ("AcquisitionFrameRate", "ExposureTime", "Gain", "Gamma")
 _IDENTITY_KEY = "camera_identity"
 
 # Fixed slot order: index 0 is always UVL, index 1 is always UVR — regardless
@@ -106,3 +106,7 @@ def load_timer_seconds() -> int:
     except (TypeError, ValueError):
         return 0
     return value if value > 0 else 0
+
+
+def load_lossless_video() -> bool:
+    return bool(load_config().get("lossless_video", False))
